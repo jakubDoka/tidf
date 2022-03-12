@@ -1,0 +1,22 @@
+[package]
+name = "defend_us"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+raylib = "3.7.0"
+hecs = "0.7.6"
+util = { path = "util" }
+assets = { path = "assets" }
+bitwise = { path = "bitwise" }
+
+[workspace]
+members = [
+    "util",
+    "derive",
+    "assets",
+    "server",
+    "bitwise",
+]
