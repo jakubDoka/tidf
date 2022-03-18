@@ -18,10 +18,10 @@ macro_rules! impl_id_des {
                         util::meta_data::Yaml::Scalar(name) => {
                             *self = state.$storage
                                 .get(name)
-                                .ok_or_else(|| 
+                                .ok_or_else(||
                                     format!(concat!(stringify!($name), " '{}' not found"), node)
                                 )?;
-     
+
                         },
                         $(
                             util::meta_data::Yaml::Mapping(_) => {
@@ -31,7 +31,7 @@ macro_rules! impl_id_des {
                         )?
                         _ => return Err(format!(concat!("expected ", stringify!($name), " name, got {}"), node)),
                     }
-                    
+
                     Ok(())
                 }
             }
@@ -46,7 +46,7 @@ create_access!(
 impl Deserialize<Assets> for Map {
     fn deserialize_into(&mut self, state: &mut Assets, node: util::meta_data::Yaml) -> Result<(), String> {
         match node {
-                
+
             _ => Err(format!("expected mapping, got {:?}", node)),
         }
     }
@@ -160,8 +160,8 @@ impl Assets {
             }
         }
         repeat_state_load!(
-            healths 
-            damages 
+            healths
+            damages
             hit_boxes
             buildings
         );

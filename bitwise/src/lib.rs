@@ -4,21 +4,69 @@ use std::marker::PhantomData;
 
 pub use derive::Bitwise;
 
+pub struct Encoder {
+    pub data: Vec<u8>,
+}
+
+impl Encoder {
+    pub const LEN_SIZE: usize = 4;
+
+    pub fn new() -> Self {
+        Self {
+            data: vec![0; Self::LEN_SIZE],
+        }
+    }
+
+    pub fn assert_empty(&self) {
+        assert_eq!(self.data.len(), Self::LEN_SIZE);
+    }
+
+    pub fn clear(&mut self) {
+        self.data.truncate(Self::LEN_SIZE);
+    }
+
+    pub fn encode_str(&mut self, s: &str) {
+        self.encode(&(s.len() as u32));
+        self.data.extend_from_slice(s.as_bytes());
+    }
+
+    pub fn encode<T: Bitwise>(&mut self, value: &T) {
+        value.encode(&mut self.data);
+    }
+
+    pub fn data(&mut self) -> &[u8] {
+        let len = ((self.data.len() - Self::LEN_SIZE) as u32).to_le_bytes();
+        self.data.copy_from_slice(&len);
+        &self.data
+    }
+}
+
 pub struct Decoder {
     buffer: Vec<u8>,
     cursor: usize,
 }
 
 impl Decoder {
-    pub fn new(buffer: Vec<u8>) -> Self {
+    pub fn new() -> Self {
         Self {
-            buffer,
+            buffer: vec![],
             cursor: 0,
         }
     }
 
-    pub fn buffer(&mut self) -> &mut Vec<u8> {
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    pub fn expose(&mut self, size: usize) -> &mut [u8] {
         self.cursor = 0;
+        if self.buffer.capacity() < size {
+            self.buffer.reserve(size - self.buffer.capacity());
+        }
+        unsafe {
+            self.buffer.set_len(size);
+        }
+
         &mut self.buffer
     }
 
@@ -48,15 +96,15 @@ macro_rules! impl_bitwise_for_number {
                     let bytes = self.to_le_bytes();
                     buffer.extend_from_slice(&bytes);
                 }
-            
+
                 fn decode(&mut self, cursor: &mut usize, buffer: &[u8]) -> Option<()> {
                     if buffer.len() < *cursor + std::mem::size_of::<$number>() {
                         return None;
                     }
-            
+
                     *self = $number::from_le_bytes(buffer[*cursor..*cursor + std::mem::size_of::<$number>()].try_into().unwrap());
                     *cursor += std::mem::size_of::<$number>();
-            
+
                     Some(())
                 }
             }
@@ -80,7 +128,9 @@ impl Bitwise for String {
         }
 
         // we take invalid string as aggression and ignore it
-        *self = std::str::from_utf8(&buffer[*cursor..*cursor + len]).ok()?.to_string();
+        *self = std::str::from_utf8(&buffer[*cursor..*cursor + len])
+            .ok()?
+            .to_string();
         *cursor += len;
 
         Some(())
@@ -171,6 +221,19 @@ impl_bitwise_for_number!(
 mod test {
     use super::*;
 
+    #[derive(Bitwise, Debug, PartialEq)]
+    enum Goo {
+        A { a: u8, b: u16 },
+        B(i32, i32),
+        C,
+    }
+
+    impl Default for Goo {
+        fn default() -> Self {
+            Goo::C
+        }
+    }
+
     #[derive(Bitwise, Debug, Default, PartialEq)]
     struct Foo {
         a: u8,
@@ -191,6 +254,9 @@ mod test {
         p: Vec<u8>,
         q: HashMap<u8, u16>,
         r: bool,
+        s: Goo,
+        t: Goo,
+        u: Goo,
     }
 
     #[test]
@@ -214,7 +280,9 @@ mod test {
             m: 13.0,
             n: 14.0,
             o: "hello world".to_string(),
-            p: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+            p: vec![
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+            ],
             q: {
                 let mut q = HashMap::new();
                 q.insert(1, 2);
@@ -223,6 +291,9 @@ mod test {
                 q
             },
             r: true,
+            s: Goo::A { a: 1, b: 2 },
+            t: Goo::B(3, 4),
+            u: Goo::C,
         };
 
         foo.encode(&mut buffer);
@@ -232,5 +303,4 @@ mod test {
 
         assert_eq!(foo, foo2);
     }
-
 }

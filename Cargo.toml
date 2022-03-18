@@ -11,6 +11,8 @@ hecs = "0.7.6"
 util = { path = "util" }
 assets = { path = "assets" }
 bitwise = { path = "bitwise" }
+server = { path = "server" }
+store = { path = "store" }
 
 [workspace]
 members = [
@@ -19,4 +21,5 @@ members = [
     "assets",
     "server",
     "bitwise",
+    "store",
 ]

@@ -1,5 +1,6 @@
-use proc_macro::TokenStream;
-use syn::{parenthesized, parse::Parse, token, DeriveInput, Ident, spanned::Spanned};
+use proc_macro::{TokenStream, Literal};
+use quote::ToTokens;
+use syn::{parenthesized, parse::Parse, spanned::Spanned, token, DeriveInput, Ident, LitInt};
 
 struct ParserAttr {
     _paren: token::Paren,
@@ -94,46 +95,184 @@ pub fn bitwise_derive(input: TokenStream) -> TokenStream {
 
     let name = &input.ident;
 
-    let (ser_body, de_body, bound_checks) = match &input.data {
+    let result = match &input.data {
         syn::Data::Struct(data) => {
             let bound_checks = data.fields.iter().map(|field| {
                 let ty = &field.ty;
-                quote::quote_spanned! {ty.span()=> 
+                quote::quote_spanned! {ty.span()=>
                     const _: Option<BitwiseBoundCheck<#ty>> = None;
                 }
             });
-            let ser_body = data.fields.iter().map(|field| {
-                let ident = &field.ident;
-                
+            let ser_body = data.fields.iter().enumerate().map(|(i, field)| {
+                let ident = field
+                    .ident
+                    .clone()
+                    .map(|i| i.to_token_stream())
+                    .unwrap_or_else(|| syn::Index::from(i).to_token_stream());
+
                 quote::quote! {
                     self.#ident.encode(buffer);
                 }
             });
-            let de_body = data.fields.iter().map(|field| {
-                let ident = &field.ident;
+            let de_body = data.fields.iter().enumerate().map(|(i, field)| {
+                let ident = field
+                    .ident
+                    .clone()
+                    .map(|i| i.to_token_stream())
+                    .unwrap_or_else(|| syn::Index::from(i).to_token_stream());
                 quote::quote! {
                     self.#ident.decode(cursor, buffer)?;
                 }
             });
-            (ser_body, de_body, bound_checks)
+
+            quote::quote! {
+                #(#bound_checks)*
+                impl Bitwise for #name {
+                    fn encode(&self, buffer: &mut Vec<u8>) {
+                        #(#ser_body)*
+                    }
+
+                    fn decode(&mut self, cursor: &mut usize, buffer: &[u8]) -> Option<()> {
+                        #(#de_body)*
+
+                        Some(())
+                    }
+                }
+            }
         }
-        syn::Data::Enum(_) => panic!("enum is not supported yet"),
+        syn::Data::Enum(data) => {
+            let enc_code = data.variants.iter().enumerate().map(|(i, v)| {
+                let ident = &v.ident;
+
+                const U8MAX: usize = u8::MAX as usize;
+                const U16MAX: usize = u16::MAX as usize;
+                const U32MAX: usize = u32::MAX as usize;
+
+
+                let i = LitInt::from(match data.variants.len() {
+                    0..=U8MAX => {
+                        Literal::u8_suffixed(i as u8)
+                    }
+                    0..=U16MAX => {
+                        Literal::u16_suffixed(i as u16)
+                    }
+                    0..=U32MAX => {
+                        Literal::u32_suffixed(i as u32)
+                    }
+                    _ => {
+                        Literal::u64_suffixed(i as u64)
+                    }
+                });
+
+                let encodes = v.fields.iter().enumerate().map(|(i, f)| {
+                    let ident = f
+                        .ident
+                        .clone()
+                        .unwrap_or_else(|| quote::format_ident!("f{}", i));
+                    quote::quote! {
+                        #ident.encode(buffer);
+                    }
+                });
+
+                if v.fields.iter().any(|f| f.ident.is_some()) {
+                    let names = v.fields.iter().map(|f| &f.ident);
+                    quote::quote! {
+                        Self::#ident { #(#names),* } => {
+                            #i.encode(buffer);
+                            #(#encodes)*
+                        }
+                    }
+                } else {
+                    if v.fields.len() == 0 {
+                        quote::quote! {
+                            Self::#ident => {
+                                #i.encode(buffer);
+                            }
+                        }
+                    } else {
+                        let names = v
+                            .fields
+                            .iter()
+                            .enumerate()
+                            .map(|(i, _)| quote::format_ident!("f{}", i));
+                        quote::quote! {
+                            Self::#ident(#(#names),*) => {
+                                #i.encode(buffer);
+                                #(#encodes)*
+                            }
+                        }
+                    }
+                }
+            });
+
+            let dec_code = data.variants.iter().enumerate().map(|(i, v)| {
+                let ident = &v.ident;
+
+                let decodes = v.fields.iter().enumerate().map(|(i, f)| {
+                    let ident = f
+                        .ident
+                        .clone()
+                        .unwrap_or_else(|| quote::format_ident!("f{}", i));
+                    let datatype = &f.ty;
+                    quote::quote! {
+                        let mut #ident = <#datatype>::default();
+                        #ident.decode(cursor, buffer)?;
+                    }
+                });
+
+                if v.fields.iter().any(|f| f.ident.is_some()) {
+                    let names = v.fields.iter().map(|f| &f.ident);
+                    quote::quote! {
+                        #i => {
+                            #(#decodes)*
+                            *self = Self::#ident { #(#names),* };
+                        }
+                    }
+                } else {
+                    if v.fields.len() == 0 {
+                        quote::quote! {
+                            #i => {
+                                *self = Self::#ident;
+                            }
+                        }
+                    } else {
+                        let names = v
+                            .fields
+                            .iter()
+                            .enumerate()
+                            .map(|(i, _)| quote::format_ident!("f{}", i));
+                        quote::quote! {
+                            #i => {
+                                #(#decodes)*
+                                *self = Self::#ident(#(#names),*);
+                            }
+                        }
+                    }
+                }
+            });
+
+            quote::quote! {
+                impl Bitwise for #name {
+                    fn encode(&self, buffer: &mut Vec<u8>) {
+                        match self {
+                            #(#enc_code)*
+                        }
+                    }
+
+                    fn decode(&mut self, cursor: &mut usize, buffer: &[u8]) -> Option<()> {
+                        let mut id: usize = 0;
+                        id.decode(cursor, buffer)?;
+                        match id {
+                            #(#dec_code)*
+                            _ => return None,
+                        }
+
+                        Some(())
+                    }
+                }
+            }
+        }
         syn::Data::Union(_) => panic!("union is not supported"),
-    };
-
-    let result = quote::quote! {
-        #(#bound_checks)*
-        impl Bitwise for #name {
-            fn encode(&self, buffer: &mut Vec<u8>) {
-                #(#ser_body)*
-            }
-
-            fn decode(&mut self, cursor: &mut usize, buffer: &[u8]) -> Option<()> {
-                #(#de_body)*
-
-                Some(())
-            }
-        }
     };
 
     TokenStream::from(result)

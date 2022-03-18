@@ -2,10 +2,10 @@
 #![feature(negative_impls)]
 #![feature(tcplistener_into_incoming)]
 
-mod server;
+extern crate server;
 
 fn main() {
-    let mut server = server::Server::new(4, 30, 8080);
+    let mut server = server::server::Server::new(4, 30, 8080);
 
     server.run().unwrap();
 }

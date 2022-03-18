@@ -1,7 +1,7 @@
 use std::{
+    cell::RefCell,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
-    ops::{Deref, DerefMut, Index, IndexMut},
     sync::{
         atomic::{AtomicI64, Ordering},
         mpsc::{self, Receiver, Sender},
@@ -11,10 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const ERROR_OC: u32 = 0;
-pub const PLAYER_JOIN_OC: u32 = 1;
-pub const JOIN_REQUEST_OC: u32 = 2;
-pub const KICK_REQUEST_OC: u32 = 3;
+use crate::protocol::{JoinInfo, JoinRequestData, Packet, Player, Session};
+use bitwise::*;
+use store::PoolStore;
 
 macro_rules! log {
     ($template:literal, $($arg:expr),*) => {
@@ -38,11 +37,6 @@ macro_rules! log {
     };
 }
 
-pub auto trait NotReference {}
-
-impl<'a, T> !NotReference for &'a T {}
-impl<'a, T> !NotReference for &'a mut T {}
-
 pub struct Server {
     port: u16,
     threads: Vec<ThreadHandle>,
@@ -64,13 +58,14 @@ impl Server {
     }
 
     pub fn run(&mut self) -> std::io::Result<()> {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", self.port))?;
+        let listener = TcpListener::bind(("127.0.0.1", self.port))?;
+        let mut decoder = Decoder::new();
 
         println!("Starting to listen udp at port {}!", self.port);
 
         for connection in listener.incoming() {
             match connection {
-                Ok(conn) => self.handle_connection(conn),
+                Ok(conn) => self.handle_connection(&mut decoder, conn),
                 Err(e) => {
                     log!("Error when dispatching connections: {}", e);
                 }
@@ -80,12 +75,12 @@ impl Server {
         Ok(())
     }
 
-    pub fn handle_connection(&mut self, conn: TcpStream) {
+    pub fn handle_connection(&mut self, decoder: &mut Decoder, conn: TcpStream) {
         let mut player = PlayerEnt::new(conn);
 
         player.start_join_timeout();
 
-        let request_data = match player.read_join_request() {
+        let request_data = match player.read_join_request(decoder) {
             Some(data) => data,
             None => {
                 log!(player.error("Join request in invalid format!"));
@@ -138,7 +133,7 @@ pub struct ThreadState {
     id: u32,
     port: u16,
     resources: Arc<AtomicI64>,
-    sessions: PoolStorage<Session, SessionEnt>,
+    sessions: PoolStore<Session, SessionEnt>,
 }
 
 impl ThreadState {
@@ -147,13 +142,14 @@ impl ThreadState {
             id: id as u32,
             port: port + id as u16,
             resources,
-            sessions: PoolStorage::new(),
+            sessions: PoolStore::new(),
         }
     }
 
     pub fn run(&mut self, fps: usize, mut new_connections: Receiver<JoinRequest>) {
         let mut limiter = FrameLimiter::new();
-        let mut udp_reader = Buffer::new();
+        let mut decoder = Decoder::new();
+        let mut encoder = Encoder::new();
         let mut package_pool = vec![];
         let mut packages = vec![];
         let mut kick_queue = vec![];
@@ -163,14 +159,16 @@ impl ThreadState {
         println!("Starting to listen udp on port {}!", self.port);
         let mut udp = UdpSocket::bind(format!("127.0.0.1:{}", self.port))
             .expect("Could not bind UDP socket!");
-        udp.set_nonblocking(true).expect("Could not set nonblocking!");
+        udp.set_nonblocking(true)
+            .expect("Could not set nonblocking!");
 
         loop {
-            self.collect_new_connections(&mut new_connections);
+            self.collect_new_connections(&mut encoder, &mut new_connections);
 
-            match self.handle_udp_packets(
+            match self.collect_udp_packets(
                 &mut udp,
-                &mut udp_reader,
+                &mut decoder,
+                &mut encoder,
                 &mut kick_queue,
                 &mut package_pool,
             ) {
@@ -184,7 +182,13 @@ impl ThreadState {
             for (session_id, session) in self.sessions.iter_mut() {
                 for (id, player) in session.players.iter_mut() {
                     if player
-                        .collect_tcp_packages(session_id, id, &mut package_pool, &mut packages)
+                        .collect_tcp_packages(
+                            session_id,
+                            id,
+                            &mut package_pool,
+                            &mut packages,
+                            &mut decoder,
+                        )
                         .is_none()
                     {
                         kick_queue.push(id);
@@ -192,7 +196,7 @@ impl ThreadState {
                 }
 
                 for package in &packages {
-                    session.send_package(&package, &mut kick_queue, &mut udp);
+                    session.send_package(&mut encoder, &package, &mut kick_queue, &mut udp);
                 }
                 package_pool.append(&mut packages);
 
@@ -216,11 +220,15 @@ impl ThreadState {
         }
     }
 
-    pub fn collect_new_connections(&mut self, new_connections: &mut Receiver<JoinRequest>) {
+    pub fn collect_new_connections(
+        &mut self,
+        encoder: &mut Encoder,
+        new_connections: &mut Receiver<JoinRequest>,
+    ) {
         for JoinRequest { mut player, data } in new_connections.try_iter() {
             log!("Connection arrived!",);
-            if data.session == JoinRequestData::NEW_SESSION {
-                self.create_session(data.password, player);
+            if data.session == JoinRequestData::NEW_SESSION_ID {
+                self.create_session(encoder, data.password, player);
                 continue;
             }
 
@@ -229,32 +237,48 @@ impl ThreadState {
             }
 
             log!("Player is joining session {}", data.session.0);
-            self.sessions[data.session].accept(self.id, data.session, self.port, data.password, player);
+            self.sessions[data.session].accept(
+                encoder,
+                self.id,
+                data.session,
+                self.port,
+                data.password,
+                player,
+            );
         }
     }
 
-    pub fn create_session(&mut self, password: u128, player: PlayerEnt) {
+    pub fn create_session(&mut self, encoder: &mut Encoder, password: u128, player: PlayerEnt) {
         let session = SessionEnt::new(password, player);
-        let owner = session.owner();
-        let id = self.sessions.push(session);
-        log!("Session created with id {}", id.0);
-        log!(self.sessions[id].send_join_info(self.id, id, owner, self.port));
+        let joined = session.owner();
+        let session = self.sessions.push(session);
+        log!("Session created with id {}", session.0);
+        encoder.encode(&JoinInfo {
+            session,
+            joined,
+            thread_id: self.id,
+            udp_port: self.port,
+        });
+        log!(self.sessions[session].send_join_info(joined, encoder));
+        encoder.clear();
     }
 
-    pub fn handle_udp_packets(
+    pub fn collect_udp_packets(
         &mut self,
         udp: &mut UdpSocket,
-        buffer: &mut Buffer,
+        decoder: &mut Decoder,
+        encoder: &mut Encoder,
         kick_queue: &mut Vec<Player>,
-        package_pool: &mut Vec<Package>,
+        package_pool: &mut Vec<Packet>,
     ) -> std::io::Result<()> {
         let mut size = [0u8; 4];
         loop {
             udp.peek(&mut size)?;
             let size = u32::from_le_bytes(size);
-            let addr = buffer.load(size as usize, udp)?;
+            let (_, addr) = udp.recv_from(decoder.expose(size as usize + Encoder::LEN_SIZE))?;
+            decoder.decode::<u32>();
             let mut package = package_pool.pop().unwrap_or_default();
-            if package.load(None, buffer).is_none() {
+            if decoder.decode_into(&mut package).is_none() {
                 package_pool.push(package);
                 continue;
             }
@@ -277,13 +301,13 @@ impl ThreadState {
             }
 
             let player = &mut session.players[package.source];
-            if !player.set_udp_addr(addr) {
+            if !player.set_udp_addr(Some(addr)) {
                 log!(player.error("Udp and tcp ip does not match!"));
                 package_pool.push(package);
                 continue;
             }
 
-            session.send_package(&package, kick_queue, udp);
+            session.send_package(encoder, &package, kick_queue, udp);
             for kick in kick_queue.drain(..) {
                 // no duplicates this time since we send
                 // just one packet
@@ -295,57 +319,15 @@ impl ThreadState {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct Package {
-    op_code: u32,
-    source: Player,
-    session: Session,
-    tcp: bool,
-    targets: Vec<Player>,
-    data: Vec<u8>,
-}
-
-impl Package {
-    pub fn load(&mut self, hint: Option<(Session, Player)>, buffer: &mut Buffer) -> Option<()> {
-        self.op_code = buffer.read()?;
-        self.source = buffer.read()?;
-        self.session = buffer.read()?;
-        if let Some((session, source)) = hint {
-            if self.session != session || self.source != source {
-                return None;
-            }
-        }
-        self.tcp = buffer.read()?;
-
-        self.targets.clear();
-        buffer.read_into(&mut self.targets)?;
-
-        self.data.clear();
-        buffer.read_into(&mut self.data)?;
-
-        Some(())
-    }
-
-    fn write(&self, buffer: &mut Buffer) {
-        buffer.write(self.op_code);
-        buffer.write(self.source);
-        // not important to client
-        //buffer.write(self.session);
-        //buffer.write(self.tcp);
-        //buffer.write(self.targets.as_slice());
-        buffer.write(self.data.as_slice());
-    }
-}
-
 pub struct SessionEnt {
-    players: PoolStorage<Player, PlayerEnt>,
+    players: PoolStore<Player, PlayerEnt>,
     password: u128,
     owner: Player,
 }
 
 impl SessionEnt {
     pub fn new(password: u128, owner: PlayerEnt) -> Self {
-        let mut players = PoolStorage::new();
+        let mut players = PoolStore::new();
         let owner = players.push(owner);
         Self {
             players,
@@ -354,18 +336,32 @@ impl SessionEnt {
         }
     }
 
-    pub fn accept(&mut self, thread_id: u32, session: Session, udp_port: u16, password: u128, mut player: PlayerEnt) {
+    pub fn accept(
+        &mut self,
+        encoder: &mut Encoder,
+        thread_id: u32,
+        session: Session,
+        udp_port: u16,
+        password: u128,
+        mut player: PlayerEnt,
+    ) {
         if self.password != password {
             log!(player.error("Wrong password!"));
             return;
         }
 
-        let id = self.players.push(player);
-        if let Err(e) = self.send_join_info(thread_id, session, id, udp_port) {
+        let joined = self.players.push(player);
+        encoder.encode(&JoinInfo {
+            thread_id,
+            session,
+            joined,
+            udp_port,
+        });
+        if let Err(e) = self.send_join_info(joined, encoder) {
             log!("failed to send join info: {}", e);
-            self.players.remove(id);
+            self.players.remove(joined);
         };
-        log!("Session joined with id {}", id.0);
+        log!("Session joined with id {}", joined.0);
     }
 
     pub fn kick(&mut self, by: Player, target: Player) {
@@ -377,41 +373,49 @@ impl SessionEnt {
         log!(self.players.remove(target).error("You have been kicked!"));
     }
 
-    pub fn send_join_info(&mut self, thread_id: u32, session: Session, joined: Player, udp_port: u16) -> std::io::Result<()> {
+    pub fn send_join_info(&mut self, joined: Player, encoder: &mut Encoder) -> std::io::Result<()> {
         self.players[joined].stop_blocking();
-
-        for (_, player) in self.players.iter_mut() {
-            player.send_join_info(thread_id, session, joined, udp_port)?;
+        for player in self.players.values_mut() {
+            player.send(encoder, &None)?;
         }
-
         Ok(())
     }
 
-    fn send_package(&mut self, package: &Package, kick_queue: &mut Vec<Player>, udp: &mut UdpSocket) {
-        match package.op_code {
+    fn send_package(
+        &mut self,
+        encoder: &mut Encoder,
+        data: &Packet,
+        kick_queue: &mut Vec<Player>,
+        udp: &mut UdpSocket,
+    ) {
+        match data.op_code {
             KICK_REQUEST_OC => {
-                if package.targets.is_empty() {
-                    log!(self.players[package.source].error("No target specified!"));
+                if data.targets.is_empty() {
+                    log!(self.players[data.source].error("No target specified!"));
                 } else {
-                    self.kick(package.source, package.targets[0]);
+                    self.kick(data.source, data.targets[0]);
                 }
             }
             _ => (),
         }
-        if package.targets.is_empty() {
+
+        encoder.encode(data);
+        let udp = if data.tcp { None } else { Some(udp) };
+
+        if data.targets.is_empty() {
             for (id, player) in self.players.iter_mut() {
-                if package.source == id {
+                if data.source == id {
                     continue;
-                }  
-                
-                if player.send_package(package, udp).is_none() {
+                }
+
+                if player.send_packet(encoder, &udp).is_none() {
                     kick_queue.push(id);
                 }
             }
         } else {
-            for &target in &package.targets {
+            for &target in &data.targets {
                 if self.players.is_valid(target) {
-                    if self.players[target].send_package(package, udp).is_none() {
+                    if self.players[target].send_packet(encoder, &udp).is_none() {
                         kick_queue.push(target);
                     }
                 }
@@ -465,29 +469,10 @@ impl JoinRequest {
     }
 }
 
-pub struct JoinRequestData {
-    password: u128,
-    session: Session,
-    thread: u32,
-}
-
-impl JoinRequestData {
-    pub const NEW_SESSION: Session = Session(u32::MAX);
-
-    pub fn from_buffer(buffer: &mut Buffer) -> Option<Self> {
-        Some(Self {
-            password: buffer.read()?,
-            session: buffer.read()?,
-            thread: buffer.read()?,
-        })
-    }
-}
-
 pub struct PlayerEnt {
     last_packet: Instant,
     tcp: TcpStream,
     udp_addr: Option<SocketAddr>,
-    buffer: Buffer,
 }
 
 impl PlayerEnt {
@@ -496,7 +481,6 @@ impl PlayerEnt {
             last_packet: Instant::now(),
             tcp,
             udp_addr: None,
-            buffer: Buffer::new(),
         }
     }
 
@@ -514,16 +498,20 @@ impl PlayerEnt {
         &mut self,
         session: Session,
         this: Player,
-        pool: &mut Vec<Package>,
-        packages: &mut Vec<Package>,
+        pool: &mut Vec<Packet>,
+        packages: &mut Vec<Packet>,
+        decoder: &mut Decoder,
     ) -> Option<()> {
         loop {
-            match self.recv_tcp() {
+            match self.recv_tcp(decoder, None) {
                 Ok(_) => {
-                    let mut package = pool.pop().unwrap_or_default();
-                    package.load(Some((session, this)), &mut self.buffer)?;
-                    self.buffer.clear();
-                    packages.push(package);
+                    let mut packet = pool.pop().unwrap_or_default();
+                    decoder.decode_into(&mut packet)?;
+                    if packet.session != session || packet.source == this {
+                        log!("invalid packet: {:?}", packet);
+                        continue;
+                    }
+                    packages.push(packet);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     if self.is_inactive() {
@@ -544,73 +532,66 @@ impl PlayerEnt {
 
     pub fn error(&mut self, message: &str) -> std::io::Result<()> {
         log!("error sent to {}: {}", self.tcp.peer_addr()?, message);
-        self.write(ERROR_OC);
-        self.write(message);
-        self.send(None)
+        thread_local! {
+            static ERROR_ENCODER: RefCell<Encoder> = RefCell::new(Encoder::new());
+        }
+
+        ERROR_ENCODER.with(|encoder| {
+            let mut encoder = encoder.borrow_mut();
+            encoder.assert_empty();
+            encoder.encode(&ERROR_OC);
+            encoder.encode_str(message);
+            self.send(&mut *encoder, &None)?;
+            encoder.clear();
+            Ok(())
+        })
     }
 
-    fn send_join_info(&mut self, thread_id: u32, session: Session, joined: Player, udp_port: u16) -> std::io::Result<()> {
-        self.write(PLAYER_JOIN_OC);
-        self.write(thread_id);
-        self.write(session);
-        self.write(joined);
-        self.write(udp_port);
-        self.send(None)
-    }
-
-    fn send_package(&mut self, package: &Package, udp: &mut UdpSocket) -> Option<()> {
-        package.write(&mut self.buffer);
-
-        match self.send(if package.tcp { None } else { Some(udp) }) {
-            Ok(_) => Some(()),
+    fn send_packet(&mut self, data: &mut Encoder, udp: &Option<&mut UdpSocket>) -> Option<()> {
+        match self.send(data, udp) {
             Err(err) => {
                 log!("failed to send package: {}", err);
                 None
             }
+            _ => Some(()),
         }
     }
 
-    pub fn send(&mut self, udp: Option<&mut UdpSocket>) -> std::io::Result<()> {
+    pub fn send(
+        &mut self,
+        encoder: &mut Encoder,
+        udp: &Option<&mut UdpSocket>,
+    ) -> std::io::Result<()> {
         if let Some(udp) = udp {
             if let Some(addr) = self.udp_addr {
-                udp.send_to(self.buffer.pack(false), addr)?;
+                let err = udp.send_to(encoder.data(), addr);
+                encoder.clear();
+                err?;
             }
         } else {
             log!("sending tcp package to {}", self.tcp.peer_addr()?);
-            self.tcp.write(self.buffer.pack(true))?;
+            let err = self.tcp.write(encoder.data());
+            encoder.clear();
+            err?;
         }
-        self.buffer.clear();
 
         Ok(())
     }
 
-    pub fn read_join_request(&mut self) -> Option<JoinRequestData> {
-        self.recv_weak()?;
-        // prevent spam
-        const MAX_PACKAGE_SIZE: usize = std::mem::size_of::<(u32, JoinRequestData)>();
-        if self.len() > MAX_PACKAGE_SIZE {
-            log!(
-                "initial package too big: {} > {}",
-                self.len(),
-                MAX_PACKAGE_SIZE
-            );
-            log!(self.error("Kicking for spamming!"));
-            return None;
-        }
+    pub fn read_join_request(&mut self, decoder: &mut Decoder) -> Option<JoinRequestData> {
+        self.recv_tcp_weak(decoder, Some(std::mem::size_of::<(u32, JoinRequestData)>()))?;
 
-        let op_code = self.read();
+        let op_code = decoder.decode();
 
         if op_code != Some(JOIN_REQUEST_OC) {
             return None;
         }
 
-        let req = JoinRequestData::from_buffer(&mut self.buffer);
-        self.buffer.clear();
-        req
+        decoder.decode()
     }
 
-    pub fn recv_weak(&mut self) -> Option<()> {
-        match self.recv_tcp() {
+    pub fn recv_tcp_weak(&mut self, decoder: &mut Decoder, max_size: Option<usize>) -> Option<()> {
+        match self.recv_tcp(decoder, max_size) {
             Ok(()) => Some(()),
             Err(e) => {
                 log!("failed to receive {}", e);
@@ -619,11 +600,21 @@ impl PlayerEnt {
         }
     }
 
-    pub fn recv_tcp(&mut self) -> std::io::Result<()> {
+    pub fn recv_tcp(
+        &mut self,
+        decoder: &mut Decoder,
+        max_size: Option<usize>,
+    ) -> std::io::Result<()> {
         let mut size = [0u8; 4];
         Read::read(&mut self.tcp, &mut size)?;
         let size = u32::from_le_bytes(size) as usize;
-        self.buffer.load(size, &mut self.tcp)?;
+        if max_size.map(|m| m < size).unwrap_or(false) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "package bigger then expected",
+            ));
+        }
+        self.tcp.read(decoder.expose(size))?;
         self.last_packet = Instant::now();
         Ok(())
     }
@@ -636,117 +627,4 @@ impl PlayerEnt {
     fn start_join_timeout(&mut self) {
         log!(self.tcp.set_read_timeout(Some(Duration::from_secs(1))));
     }
-}
-
-impl Deref for PlayerEnt {
-    type Target = Buffer;
-
-    fn deref(&self) -> &Self::Target {
-        &self.buffer
-    }
-}
-
-impl DerefMut for PlayerEnt {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.buffer
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct PoolStorage<K: PoolId, T> {
-    data: Vec<Option<T>>,
-    free: Vec<K>,
-}
-
-impl<K: PoolId, T> PoolStorage<K, T> {
-    pub fn new() -> Self {
-        Self {
-            data: Vec::new(),
-            free: Vec::new(),
-        }
-    }
-
-    pub fn push(&mut self, data: T) -> K {
-        if let Some(id) = self.free.pop() {
-            self.data[id.index()] = Some(data);
-            id
-        } else {
-            let id = self.data.len();
-            self.data.push(Some(data));
-            K::new(id)
-        }
-    }
-
-    pub fn _clear(&mut self) {
-        self.data.clear();
-        self.free.clear();
-    }
-
-    pub fn remove(&mut self, id: K) -> T {
-        let removed = self.data[id.index()].take().expect("double free");
-        self.free.push(id);
-        removed
-    }
-
-    pub fn is_valid(&self, id: K) -> bool {
-        id.index() < self.data.len() && self.data[id.index()].is_some()
-    }
-
-    pub fn _iter(&self) -> impl Iterator<Item = (K, &T)> {
-        self.data
-            .iter()
-            .enumerate()
-            .filter_map(|(i, x)| x.as_ref().map(|x| (K::new(i), x)))
-    }
-
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (K, &mut T)> {
-        self.data
-            .iter_mut()
-            .enumerate()
-            .filter_map(|(i, x)| x.as_mut().map(|x| (K::new(i), x)))
-    }
-
-    fn count(&self) -> usize {
-        self.data.len() - self.free.len()
-    }
-}
-
-impl<K: PoolId, T> Index<K> for PoolStorage<K, T> {
-    type Output = T;
-
-    fn index(&self, index: K) -> &Self::Output {
-        self.data[index.index()].as_ref().expect("invalid index")
-    }
-}
-
-impl<K: PoolId, T> IndexMut<K> for PoolStorage<K, T> {
-    fn index_mut(&mut self, index: K) -> &mut Self::Output {
-        self.data[index.index()].as_mut().expect("invalid index")
-    }
-}
-
-macro_rules! impl_pool_id {
-    ($($name:ident),*) => {
-        $(
-            #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-            pub struct $name(u32);
-    
-            impl PoolId for $name {
-                fn new(index: usize) -> Self {
-                    Self(index as u32)
-                }
-    
-                fn index(&self) -> usize {
-                    self.0 as usize
-                }
-            }
-        )*
-    };
-}
-
-impl_pool_id!(Player, Session);
-
-pub trait PoolId: Clone + Copy + PartialEq + Eq + Default {
-    fn new(index: usize) -> Self;
-    fn index(&self) -> usize;
 }

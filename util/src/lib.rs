@@ -9,13 +9,13 @@ pub mod pathfinder;
 pub mod quad_tree;
 pub mod sprite_sheet;
 pub mod sync;
-pub mod store;
 
 pub mod prelude {
     pub use crate::{
-        meta_data::Deserialize, ImageExtension, RaylibDrawHandleExtension,
-        RectangleExtension, Vector2Extension,
+        meta_data::Deserialize, ImageExtension, RaylibDrawHandleExtension, RectangleExtension,
+        Vector2Extension,
     };
+    pub use bitwise::*;
     pub use derive::Meta;
     pub use raylib::prelude::*;
 }

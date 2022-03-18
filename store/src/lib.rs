@@ -1,4 +1,9 @@
-use std::{marker::PhantomData, ops::{Index, IndexMut, Deref, DerefMut}};
+use std::{
+    marker::PhantomData,
+    ops::{Deref, DerefMut, Index, IndexMut},
+};
+
+pub use bitwise::*;
 
 pub struct Table<A: Access + Invalid, T: Invalid> {
     lookup: Map<A>,
@@ -70,7 +75,7 @@ pub struct Map<T: Invalid> {
 
 impl<T: Invalid> Map<T> {
     pub fn new() -> Self {
-        Self::default()     
+        Self::default()
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
@@ -91,7 +96,7 @@ impl<T: Invalid> Map<T> {
         let mut last_id = u32::MAX;
         while current != u32::MAX {
             let (identifier, value, next) = &mut self.data[current as usize];
-            
+
             if *identifier == id && !value.is_invalid() {
                 let saved_next = *next;
                 *next = self.free as u32;
@@ -128,9 +133,9 @@ impl<T: Invalid> Map<T> {
             if data.is_invalid() {
                 *identifier = id;
                 *data = t;
-                return None
+                return None;
             } else if id == *identifier {
-                return Some(std::mem::replace(data, t))
+                return Some(std::mem::replace(data, t));
             };
 
             last_id = current;
@@ -185,8 +190,8 @@ impl<T: Invalid> Map<T> {
                 return Some(data);
             }
             current = *next;
-        }   
-        
+        }
+
         None
     }
 
@@ -223,6 +228,89 @@ impl<T: Invalid> Default for Map<T> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct PoolStore<A: Access, T> {
+    data: Vec<Option<T>>,
+    free: Vec<A>,
+}
+
+impl<A: Access, T> PoolStore<A, T> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn count(&self) -> usize {
+        self.data.len() - self.free.len()
+    }
+
+    pub fn push(&mut self, t: T) -> A {
+        if let Some(free) = self.free.pop() {
+            self.data[free.index()] = Some(t);
+            free
+        } else {
+            let index = self.data.len();
+            self.data.push(Some(t));
+            A::new(index)
+        }
+    }
+
+    pub fn remove(&mut self, a: A) -> T {
+        let index = a.index();
+        let t = std::mem::replace(&mut self.data[index], None);
+        self.free.push(a);
+        t.unwrap()
+    }
+
+    pub fn is_valid(&self, a: A) -> bool {
+        self.data[a.index()].is_some()
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        self.data.iter().filter_map(|x| x.as_ref())
+    }
+
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.data.iter_mut().filter_map(|x| x.as_mut())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (A, &T)> {
+        self.data
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| t.as_ref().map(|t| (A::new(i), t)))
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (A, &mut T)> {
+        self.data
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, t)| t.as_mut().map(|t| (A::new(i), t)))
+    }
+}
+
+impl<A: Access, T> Default for PoolStore<A, T> {
+    fn default() -> Self {
+        Self {
+            data: Vec::new(),
+            free: Vec::new(),
+        }
+    }
+}
+
+impl<A: Access, T> Index<A> for PoolStore<A, T> {
+    type Output = T;
+
+    fn index(&self, index: A) -> &Self::Output {
+        self.data[index.index() as usize].as_ref().unwrap()
+    }
+}
+
+impl<A: Access, T> IndexMut<A> for PoolStore<A, T> {
+    fn index_mut(&mut self, index: A) -> &mut Self::Output {
+        self.data[index.index() as usize].as_mut().unwrap()
+    }
+}
+
 pub struct Store<A: Access, T> {
     data: Vec<T>,
     _pd: PhantomData<A>,
@@ -243,7 +331,10 @@ impl<A: Access, T> Store<A, T> {
     }
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (A, &mut T)> {
-        self.data.iter_mut().enumerate().map(|(i, t)| (A::new(i), t))
+        self.data
+            .iter_mut()
+            .enumerate()
+            .map(|(i, t)| (A::new(i), t))
     }
 
     pub fn values(&self) -> impl Iterator<Item = &T> {
@@ -343,17 +434,12 @@ pub struct Identifier(pub u64);
 impl Identifier {
     pub fn new(name: &str) -> Self {
         // This is sdbm hash.
-        Self(
-            name
-                .as_bytes()
-                .iter()
-                .fold(0, |acc, &c| 
-                    (c as u64)
-                        .wrapping_add(acc << 6)
-                        .wrapping_add(acc << 16)
-                        .wrapping_sub(acc)
-                )
-        )
+        Self(name.as_bytes().iter().fold(0, |acc, &c| {
+            (c as u64)
+                .wrapping_add(acc << 6)
+                .wrapping_add(acc << 16)
+                .wrapping_sub(acc)
+        }))
     }
 }
 
@@ -382,32 +468,32 @@ pub trait Access: Clone + Copy + Eq + PartialEq {
 macro_rules! create_access {
     ($($name:ident)*) => {
         $(
-            #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+            #[derive(Bitwise, Copy, Clone, Debug, PartialEq, Eq)]
             pub struct $name(pub u32);
-    
-            impl $crate::store::Access for $name {
+
+            impl $crate::Access for $name {
                 fn new(index: usize) -> Self {
                     $name(index as u32)
                 }
-    
+
                 fn index(&self) -> usize {
                     self.0 as usize
                 }
             }
-    
-            impl $crate::store::Invalid for $name {
+
+            impl $crate::Invalid for $name {
                 fn invalid() -> Self {
-                    $name(usize::MAX)
+                    $name(u32::MAX)
                 }
-    
+
                 fn is_invalid(&self) -> bool {
-                    self.0 == usize::MAX
+                    self.0 == u32::MAX
                 }
             }
-    
+
             impl Default for $name {
                 fn default() -> Self {
-                    Self::invalid()
+                    $crate::Invalid::invalid()
                 }
             }
         )*
@@ -436,7 +522,7 @@ mod test {
     #[test]
     fn fuzz_map() {
         use super::*;
-        
+
         let mut data = vec![];
         let mut std_map = HashMap::new();
         let mut map = Map::new();
@@ -451,37 +537,37 @@ mod test {
             (string, i)
         }));
 
-        crate::bench("insert my", || {
+        bench("insert my", || {
             for (key, value) in data.iter() {
                 map.insert(&key.clone(), *value);
             }
         });
 
-        crate::bench("insert std", || {
+        bench("insert std", || {
             for (key, value) in data.iter() {
                 std_map.insert(key.clone(), *value);
             }
         });
 
-        crate::bench("lookup my", || {
+        bench("lookup my", || {
             for (key, _) in data.iter() {
                 map.get(&key);
             }
-        });           
+        });
 
-        crate::bench("lookup std", || {
+        bench("lookup std", || {
             for (key, _) in data.iter() {
                 std_map.get(key);
             }
         });
 
-        crate::bench("remove my", || {
+        bench("remove my", || {
             for (key, _) in data.iter() {
                 map.remove(&key);
             }
         });
 
-        crate::bench("remove std", || {
+        bench("remove std", || {
             for (key, _) in data.iter() {
                 std_map.remove(key);
             }
@@ -489,5 +575,12 @@ mod test {
 
         map.clear();
         std_map.clear();
+    }
+
+    pub fn bench(name: &str, f: impl FnOnce()) {
+        let start = std::time::Instant::now();
+        f();
+        let end = start.elapsed();
+        println!("[{}] {}s", name, end.as_secs_f64());
     }
 }

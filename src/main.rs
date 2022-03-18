@@ -1,6 +1,6 @@
+use bitwise::*;
 use ui::MainOptions;
 use util::prelude::*;
-use bitwise::*;
 
 mod components;
 mod ui;
